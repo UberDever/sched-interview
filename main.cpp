@@ -1,3 +1,5 @@
+#include <cassert>
+#include <charconv>
 #include <chrono>
 #include <functional>
 #include <iostream>
@@ -32,6 +34,7 @@ void print(const Args&... args) {
   print_message(args...);
 }
 
+template<typename Time>
 class Scheduler {
 public:
   using Fn = std::function<void()>;
@@ -47,7 +50,7 @@ public:
     }
   };
 
-  Scheduler() {
+  Scheduler(Time& time) : time{time} {
     execution_thread = std::thread{&Scheduler::loop, this};
   }
 
@@ -57,9 +60,14 @@ public:
     }
   }
 
-  void schedule(size_t id, Fn&& fn, std::chrono::milliseconds wait_for) {
+  void schedule(size_t id, Fn&& fn, TimePoint at) {
     std::lock_guard g{jobs_mutex};
-    jobs.insert(Job{id, std::move(fn), std::chrono::steady_clock::now() + wait_for});
+    jobs.insert(Job{id, std::move(fn), at});
+  }
+
+  bool done() {
+    std::lock_guard g{jobs_mutex};
+    return jobs.empty();
   }
 
 private:
@@ -68,7 +76,7 @@ private:
       if (done() && no_tasks_left) {
         break;
       }
-      execute_pending(std::chrono::steady_clock::now());
+      execute_pending(time.now());
     }
   }
 
@@ -86,27 +94,54 @@ private:
     }
   }
 
-  bool done() {
-    std::lock_guard g{jobs_mutex};
-    return jobs.empty();
-  }
-
   std::mutex jobs_mutex;
   std::set<Job> jobs;
   std::thread execution_thread;
+  Time& time;
+};
+
+struct FakeTime {
+  FakeTime() {
+    now_ = std::chrono::steady_clock::now();
+  }
+
+  TimePoint now() {
+    std::lock_guard g{now_mutex};
+    return now_;
+  };
+
+  template<class T>
+  void advance(const T& amount) {
+    std::lock_guard g{now_mutex};
+    now_ += amount;
+  }
+
+private:
+  std::mutex now_mutex;
+  TimePoint now_;
+};
+
+struct RealTime {
+  TimePoint now() {
+    return std::chrono::steady_clock::now();
+  }
+
+  template<class T>
+  void advance(const T&) {}
 };
 
 struct Task {
-  Scheduler::Fn fn;
-  Scheduler::Ms wait_for;
+  Scheduler<FakeTime>::Fn fn;
+  Scheduler<FakeTime>::Ms wait_for;
 };
 
 int main() {
+  auto time = FakeTime{};
   {
-    auto s = Scheduler{};
+    constexpr size_t TASK_AMOUNT = 64;
+    auto s = Scheduler{time};
 
-    print("Cur time is ", std::chrono::steady_clock::now().time_since_epoch().count(), '\n');
-    for (size_t i = 0; i < 64; ++i) {
+    for (size_t i = 0; i < TASK_AMOUNT; ++i) {
       const auto now = std::chrono::steady_clock::now();
       const auto wait_for = (rand() % 20) * std::chrono::milliseconds{500};
       const auto will_be_executed_at = now + wait_for;
@@ -117,9 +152,26 @@ int main() {
           will_be_executed_at.time_since_epoch().count(),
           '\n');
       expected[i] = will_be_executed_at;
-      s.schedule(i, []() {}, wait_for);
+      s.schedule(i, []() {}, will_be_executed_at);
     }
     no_tasks_left = true;
+
+    while (!s.done()) {
+      print("advance to ?ms (if no input: 500ms):\n");
+      std::string input;
+      std::getline(std::cin, input);
+      if (input == "q") {
+        break;
+      }
+      if (input.empty()) {
+        time.advance(std::chrono::milliseconds{500});
+      } else {
+        uint64_t ms;
+        auto err = std::from_chars(input.data(), input.data() + input.size(), ms);
+        assert(err.ec == std::error_code{});
+        time.advance(std::chrono::milliseconds{ms});
+      }
+    }
 
     std::cout << std::endl;
   }
