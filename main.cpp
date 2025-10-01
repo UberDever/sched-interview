@@ -1,9 +1,12 @@
 #include <chrono>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <thread>
 #include <set>
+
+// clang++ -std=c++20 -stdlib=libc++ -fsanitize=thread,undefined,bounds main.cpp -o sched && ./sched
 
 class Scheduler {
 public:
@@ -59,12 +62,16 @@ struct Task {
 
 int main() {
   auto s = Scheduler{};
-  auto t1 = std::thread{[&s]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1500});
-    while (!s.done()) {
-      s.execute_pending(std::chrono::steady_clock::now());
-    }
-  }};
+  std::promise<void> start_promise;
+  std::future<void> start_signal = start_promise.get_future();
+  auto t1 = std::thread{
+      [&s](std::future<void> start_signal) {
+        start_signal.wait();
+        while (!s.done()) {
+          s.execute_pending(std::chrono::steady_clock::now());
+        }
+      },
+      std::move(start_signal)};
 
   std::cout << "Cur time is " << std::chrono::steady_clock::now().time_since_epoch().count()
             << std::endl;
@@ -76,6 +83,7 @@ int main() {
               << (now + j.wait_for).time_since_epoch().count() << std::endl;
     s.schedule(std::move(j.fn), j.wait_for);
   }
+  start_promise.set_value();
 
   t1.join();
   return 0;
