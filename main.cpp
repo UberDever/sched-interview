@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <set>
@@ -20,12 +21,12 @@ std::atomic_bool no_tasks_left = false;
 
 template<typename Arg>
 void print_message(const Arg& arg) {
-  std::cout << arg;
+  // std::cout << arg;
 }
 
 template<typename Arg, typename... Args>
 void print_message(const Arg& arg, const Args&... rest) {
-  std::cout << arg;
+  // std::cout << arg;
   print_message(rest...);
 }
 
@@ -45,9 +46,16 @@ public:
     size_t id;
     Fn fn;
     TimePoint launch_at;
+    bool canceled;
 
     bool operator<(const Job& rhs) const {
       return launch_at < rhs.launch_at;
+    }
+  };
+
+  struct JobComparator {
+    bool operator()(const std::shared_ptr<Job>& lhs, const std::shared_ptr<Job>& rhs) const {
+      return *lhs < *rhs;
     }
   };
 
@@ -61,15 +69,25 @@ public:
     }
   }
 
-  void schedule(size_t id, Fn&& fn, TimePoint at) {
+  std::weak_ptr<Job> schedule(size_t id, Fn&& fn, TimePoint at) {
     std::lock_guard g{jobs_mutex};
-    jobs.insert(Job{id, std::move(fn), at});
+    auto ptr = std::make_shared<Job>(id, std::move(fn), at, false);
+    jobs.insert(ptr);
     jobs_condvar.notify_one();
+    return std::weak_ptr<Job>{ptr};
   }
 
   bool done() {
     std::lock_guard g{jobs_mutex};
     return jobs.empty();
+  }
+
+  void cancel(std::weak_ptr<Job>&& handle) {
+    std::lock_guard g{jobs_mutex};
+    if (handle.expired()) {
+      return;
+    }
+    handle.lock()->canceled = true;
   }
 
 private:
@@ -86,20 +104,25 @@ private:
     std::unique_lock g{jobs_mutex};
     while (!jobs.empty()) {
       auto it = jobs.begin();
-      if (it->launch_at > now) {
-        jobs_condvar.wait_until(g, it->launch_at);
+      auto ptr = it->get();
+      if (ptr->canceled) {
+        jobs.erase(it);
+        continue;
+      }
+      if (ptr->launch_at > now) {
+        jobs_condvar.wait_until(g, ptr->launch_at);
         return;
       }
-      print("Executing ", it->id, " at ", now.time_since_epoch().count(), '\n');
-      got[it->id] = now;
-      it->fn();
+      print("Executing ", ptr->id, " at ", now.time_since_epoch().count(), '\n');
+      got[ptr->id] = now;
+      ptr->fn();
       jobs.erase(it);
     }
   }
 
   std::mutex jobs_mutex;
   std::condition_variable jobs_condvar;
-  std::set<Job> jobs;
+  std::set<std::shared_ptr<Job>, JobComparator> jobs;
   std::thread execution_thread;
   Time& time;
 };
@@ -141,8 +164,10 @@ struct Task {
 
 int main() {
   auto time = RealTime{};
+
+  auto handles = std::vector<std::weak_ptr<Scheduler<RealTime>::Job>>{};
   {
-    constexpr size_t TASK_AMOUNT = 32;
+    constexpr size_t TASK_AMOUNT = 2048;
     auto s = Scheduler{time};
 
     for (size_t i = 0; i < TASK_AMOUNT; ++i) {
@@ -155,8 +180,13 @@ int main() {
           " to be executed at ",
           will_be_executed_at.time_since_epoch().count(),
           '\n');
-      expected[i] = will_be_executed_at;
-      s.schedule(i, []() {}, will_be_executed_at);
+      auto handle = s.schedule(i, []() {}, will_be_executed_at);
+      if (rand() % 255 > 64) {
+        expected[i] = will_be_executed_at;
+        handles.emplace_back(std::move(handle));
+      } else {
+        s.cancel(std::move(handle));
+      }
     }
     no_tasks_left = true;
 
@@ -183,7 +213,9 @@ int main() {
     std::cout << "sizes differ " << expected.size() << " " << got.size() << std::endl;
     return -1;
   }
-  const auto delta = std::chrono::microseconds{500};
+  std::cout << "jobs actually executed: " << handles.size() << std::endl;
+
+  const auto delta = std::chrono::microseconds{600};
   for (size_t i = 0; i < expected.size(); ++i) {
     const auto lhs = expected[i];
     const auto rhs = got[i];
