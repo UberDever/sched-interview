@@ -13,6 +13,7 @@ using TimePoint = std::chrono::steady_clock::time_point;
 std::mutex cout_mutex;
 std::unordered_map<size_t, TimePoint> expected;
 std::unordered_map<size_t, TimePoint> got;
+std::atomic_bool no_tasks_left = false;
 
 template<typename Arg>
 void print_message(const Arg& arg) {
@@ -46,9 +47,29 @@ public:
     }
   };
 
+  Scheduler() {
+    execution_thread = std::thread{&Scheduler::loop, this};
+  }
+
+  ~Scheduler() {
+    if (execution_thread.joinable()) {
+      execution_thread.join();
+    }
+  }
+
   void schedule(size_t id, Fn&& fn, std::chrono::milliseconds wait_for) {
     std::lock_guard g{jobs_mutex};
     jobs.insert(Job{id, std::move(fn), std::chrono::steady_clock::now() + wait_for});
+  }
+
+private:
+  void loop() {
+    while (true) {
+      if (done() && no_tasks_left) {
+        break;
+      }
+      execute_pending(std::chrono::steady_clock::now());
+    }
   }
 
   void execute_pending(const std::chrono::steady_clock::time_point& now) {
@@ -70,9 +91,9 @@ public:
     return jobs.empty();
   }
 
-private:
   std::mutex jobs_mutex;
   std::set<Job> jobs;
+  std::thread execution_thread;
 };
 
 struct Task {
@@ -81,35 +102,27 @@ struct Task {
 };
 
 int main() {
-  auto s = Scheduler{};
-  std::atomic_bool no_tasks_left = false;
-  auto t1 = std::thread{[&s, &no_tasks_left]() {
-    while (true) {
-      if (no_tasks_left && s.done()) {
-        break;
-      }
-      s.execute_pending(std::chrono::steady_clock::now());
+  {
+    auto s = Scheduler{};
+
+    print("Cur time is ", std::chrono::steady_clock::now().time_since_epoch().count(), '\n');
+    for (size_t i = 0; i < 64; ++i) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto wait_for = (rand() % 20) * std::chrono::milliseconds{500};
+      const auto will_be_executed_at = now + wait_for;
+      print(
+          "Scheduled ",
+          i,
+          " to be executed at ",
+          will_be_executed_at.time_since_epoch().count(),
+          '\n');
+      expected[i] = will_be_executed_at;
+      s.schedule(i, []() {}, wait_for);
     }
-  }};
+    no_tasks_left = true;
 
-  print("Cur time is ", std::chrono::steady_clock::now().time_since_epoch().count(), '\n');
-  for (size_t i = 0; i < 64; ++i) {
-    const auto now = std::chrono::steady_clock::now();
-    const auto wait_for = (rand() % 20) * std::chrono::milliseconds{500};
-    const auto will_be_executed_at = now + wait_for;
-    print(
-        "Scheduled ",
-        i,
-        " to be executed at ",
-        will_be_executed_at.time_since_epoch().count(),
-        '\n');
-    expected[i] = will_be_executed_at;
-    s.schedule(i, []() {}, wait_for);
+    std::cout << std::endl;
   }
-  no_tasks_left = true;
-
-  t1.join();
-  std::cout << std::endl;
 
   if (expected.size() != got.size()) {
     std::cout << "sizes differ " << expected.size() << " " << got.size() << std::endl;
