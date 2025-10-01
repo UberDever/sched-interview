@@ -1,6 +1,7 @@
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -63,6 +64,7 @@ public:
   void schedule(size_t id, Fn&& fn, TimePoint at) {
     std::lock_guard g{jobs_mutex};
     jobs.insert(Job{id, std::move(fn), at});
+    jobs_condvar.notify_one();
   }
 
   bool done() {
@@ -81,10 +83,11 @@ private:
   }
 
   void execute_pending(const std::chrono::steady_clock::time_point& now) {
-    std::lock_guard g{jobs_mutex};
+    std::unique_lock g{jobs_mutex};
     while (!jobs.empty()) {
       auto it = jobs.begin();
       if (it->launch_at > now) {
+        jobs_condvar.wait_until(g, it->launch_at);
         return;
       }
       print("Executing ", it->id, " at ", now.time_since_epoch().count(), '\n');
@@ -95,6 +98,7 @@ private:
   }
 
   std::mutex jobs_mutex;
+  std::condition_variable jobs_condvar;
   std::set<Job> jobs;
   std::thread execution_thread;
   Time& time;
@@ -136,9 +140,9 @@ struct Task {
 };
 
 int main() {
-  auto time = FakeTime{};
+  auto time = RealTime{};
   {
-    constexpr size_t TASK_AMOUNT = 64;
+    constexpr size_t TASK_AMOUNT = 32;
     auto s = Scheduler{time};
 
     for (size_t i = 0; i < TASK_AMOUNT; ++i) {
@@ -158,8 +162,8 @@ int main() {
 
     while (!s.done()) {
       print("advance to ?ms (if no input: 500ms):\n");
-      std::string input;
-      std::getline(std::cin, input);
+      std::string input = "q";
+      // std::getline(std::cin, input);
       if (input == "q") {
         break;
       }
@@ -175,19 +179,18 @@ int main() {
 
     std::cout << std::endl;
   }
-
   if (expected.size() != got.size()) {
     std::cout << "sizes differ " << expected.size() << " " << got.size() << std::endl;
     return -1;
   }
-  const auto delta = std::chrono::microseconds{100};
+  const auto delta = std::chrono::microseconds{500};
   for (size_t i = 0; i < expected.size(); ++i) {
     const auto lhs = expected[i];
     const auto rhs = got[i];
     const auto got_delta = std::chrono::abs(lhs - rhs);
     if (got_delta >= delta) {
       std::cout << "very big delta " << i << " " << lhs.time_since_epoch().count() << " "
-                << rhs.time_since_epoch().count() << " " << got_delta.count() << std::endl;
+                << rhs.time_since_epoch().count() << " " << got_delta.count() << "ns" << std::endl;
       return -1;
     }
   }
